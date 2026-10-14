@@ -3,7 +3,7 @@ FROM node:22-slim
 WORKDIR /app
 COPY services/graphql/package*.json ./
 RUN npm ci --omit=dev
-COPY specs/schema.graphql services/graphql/index.js ./
+COPY specs/schema.graphql services/graphql/index.js services/graphql/otel.js services/graphql/tracing.cjs ./
 ENV PORT=8000
 EXPOSE 8000
-CMD ["node", "index.js"]
+CMD ["node", "--require", "./tracing.cjs", "index.js"]
