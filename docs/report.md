@@ -219,3 +219,149 @@ sequenceDiagram
 | 3 | Thiếu thông tin | "Tạo task Review code cho Minh" | Bot hỏi hạn chót, không tự điền |
 | 4a | Trùng | "Giao cho Nam việc tối ưu trang chủ hạn 2026-10-30" → "ok" | Bot báo trùng task #4 |
 | 4b | Dữ liệu sai | "Tạo task Họp cho Lan hạn 2026-01-01" → "ok" | Bot báo hạn chót ở quá khứ, hỏi lại ngày |
+
+---
+
+# Bài 3 — Đăng nhập SSO cho Element bằng Keycloak
+
+Keycloak chỉ dùng để đăng nhập Element. MCP, GraphQL, REST không thay đổi gì. Bot `@taskbot` và `@admin` vẫn đăng nhập bằng mật khẩu.
+
+## C1 — System Context (cập nhật)
+
+```mermaid
+flowchart LR
+  user([Thành viên team]) -- chat --> element[Element]
+  user -- đăng nhập SSO --> kc[Keycloak]
+  element -- Matrix Client API --> synapse[Synapse]
+  synapse -- OIDC: đổi code lấy token, đọc userinfo --> kc
+  synapse -- sự kiện phòng --> openclaw[OpenClaw bot]
+  openclaw -- prompt / tool call --> llm[(LLM provider)]
+  openclaw -- MCP tools --> taskSys[[Hệ thống Task: MCP + GraphQL + REST]]
+```
+
+## C2 — Container (cập nhật)
+
+```mermaid
+flowchart TB
+  browser([Trình duyệt])
+  subgraph Compose [docker-compose — agent-stack]
+    element[Element :8080]
+    synapse[Synapse :8008]
+    kc[Keycloak :8180<br/>realm geo, client synapse]
+    openclaw[OpenClaw gateway<br/>bot @taskbot]
+    mcp[MCP :8004] --> gql[GraphQL :8003]
+    gql --> uapi[User API :8001] --> udb[(users.db)]
+    gql --> tapi[Task API :8002] --> tdb[(tasks.db)]
+    tapi -. xác minh người được giao .-> uapi
+  end
+  browser --> element
+  browser -- trang đăng nhập<br/>localhost:8180 --> kc
+  element --> synapse
+  synapse -- token / userinfo / jwks<br/>keycloak:8080 (mạng Docker) --> kc
+  synapse --> openclaw
+  openclaw -- mcp:8000/mcp --> mcp
+  openclaw --> llm[(OpenAI)]
+```
+
+## Sequence — đăng nhập SSO (lần đầu)
+
+```mermaid
+sequenceDiagram
+  actor U as User (trình duyệt)
+  participant E as Element :8080
+  participant S as Synapse :8008
+  participant K as Keycloak :8180
+
+  U->>E: mở trang đăng nhập
+  E->>S: GET /_matrix/client/v3/login
+  S-->>E: flows: m.login.sso [Keycloak], m.login.password
+  U->>E: bấm "Keycloak"
+  E->>S: GET /login/sso/redirect/oidc-keycloak?redirectUrl=localhost:8080
+  S-->>U: 302 → localhost:8180/realms/geo/.../auth (client_id=synapse, state, nonce)
+  U->>K: trang đăng nhập Keycloak
+  U->>K: username lan + mật khẩu
+  K-->>U: 302 → localhost:8008/_synapse/client/oidc/callback?code=…
+  U->>S: GET /oidc/callback?code=…
+  S->>K: POST keycloak:8080/.../token (code + client_secret)
+  K-->>S: id_token (iss=http://localhost:8180/realms/geo) + access_token
+  S->>K: GET keycloak:8080/.../certs (kiểm chữ ký id_token)
+  S->>K: GET keycloak:8080/.../userinfo
+  K-->>S: preferred_username=lan, name=Lan Nguyen, email
+  S->>S: localpart_template → @lan:localhost<br/>chưa có → tạo tài khoản, display name, email
+  S-->>U: 302 → localhost:8080 kèm loginToken
+  U->>E: Element đổi loginToken lấy access token (m.login.token)
+  E-->>U: đã đăng nhập @lan:localhost (Lan Nguyen)
+```
+
+Nhánh lỗi thường gặp:
+
+| Bước hỏng | Triệu chứng | Nguyên nhân |
+|---|---|---|
+| Redirect sang Keycloak | `Invalid parameter: redirect_uri` | Valid redirect URI của client khác `public_baseurl` + `_synapse/client/oidc/callback` |
+| Synapse đổi code lấy token | Quay về Synapse báo lỗi | Synapse không gọi được Keycloak, hoặc sai `client_secret` |
+| Kiểm `id_token` | Sai issuer | `KC_HOSTNAME` của Keycloak khác `issuer` trong `homeserver.yaml` |
+| Tạo tài khoản | Tài khoản đã tồn tại | Username Keycloak trùng tài khoản Synapse có sẵn (`admin`, `taskbot`) |
+
+## Cấu hình đã dùng
+
+**Keycloak** (service `keycloak` trong `docker-compose.yml`, cấu hình bằng `keycloak/setup-keycloak.sh` — tương đương thao tác tay ở mục 10.4):
+
+| Mục | Giá trị |
+|---|---|
+| Image | `quay.io/keycloak/keycloak:26.7.1`, `start-dev` |
+| `KC_HOSTNAME` | `http://localhost:8180` (cố định issuer) |
+| `KC_HOSTNAME_BACKCHANNEL_DYNAMIC` | `true` (cho Synapse gọi qua `keycloak:8080` trong mạng Docker) |
+| Realm | `geo` |
+| Client | `synapse`, Client authentication bật, Standard flow bật |
+| Valid redirect URIs | `http://localhost:8008/_synapse/client/oidc/callback` |
+| User test | `lan` (Lan Nguyen, lan@example.com), mật khẩu không Temporary |
+
+**Synapse** (`synapse-data/homeserver.yaml`, không commit — file chứa secret):
+
+```yaml
+public_baseurl: "http://localhost:8008/"
+
+oidc_providers:
+  - idp_id: keycloak
+    idp_name: "Keycloak"
+    issuer: "http://localhost:8180/realms/geo"
+    client_id: "synapse"
+    client_secret: "<ĐÃ CHE>"
+    scopes: ["openid", "profile", "email"]
+    discover: false
+    authorization_endpoint: "http://localhost:8180/realms/geo/protocol/openid-connect/auth"   # trình duyệt
+    token_endpoint: "http://keycloak:8080/realms/geo/protocol/openid-connect/token"           # Synapse, mạng Docker
+    userinfo_endpoint: "http://keycloak:8080/realms/geo/protocol/openid-connect/userinfo"
+    jwks_uri: "http://keycloak:8080/realms/geo/protocol/openid-connect/certs"
+    skip_verification: true   # local http, chỉ dùng cho local
+    user_mapping_provider:
+      config:
+        localpart_template: "{{ user.preferred_username }}"
+        display_name_template: "{{ user.name }}"
+        email_template: "{{ user.email }}"
+
+sso:
+  client_whitelist:
+    - "http://localhost:8080/"   # quay về Element không hiện trang hỏi xác nhận
+```
+
+**Khác tài liệu và lý do:**
+
+| Tài liệu | Ở đây | Lý do |
+|---|---|---|
+| `docker run keycloak` riêng + Synapse `--add-host` | Keycloak và Synapse cùng `docker-compose` | 3 endpoint phía server dùng `keycloak:8080` thay vì `host.docker.internal:8180` |
+| Không có | `KC_HOSTNAME_BACKCHANNEL_DYNAMIC=true` | Keycloak 26 chấp nhận gọi back-channel qua hostname nội bộ, issuer vẫn là `localhost:8180` |
+| Không có | `sso.client_whitelist` | Bỏ trang trung gian "Continue to localhost:8080?" của Synapse |
+| Bot chỉ cho `@admin` | Thêm `@lan:localhost` vào `groupAllowFrom` / `dm.allowFrom` | Để user SSO hỏi được bot (mục 10.7 bước 5) |
+
+## Kết quả kiểm tra
+
+| Tiêu chí (mục 10.9) | Kết quả |
+|---|---|
+| Màn hình đăng nhập Element có nút Keycloak | `GET /login` trả `m.login.sso [Keycloak]` |
+| Đăng nhập user Keycloak, tài khoản Matrix tự tạo lần đầu | `@lan:localhost`, `external_ids: oidc-keycloak` |
+| Tên hiển thị lấy từ Keycloak | `Lan Nguyen` |
+| Bot và admin vẫn đăng nhập bằng mật khẩu | `m.login.password` vẫn bật |
+| Không có secret trong repo | `homeserver.yaml`, `.env.local`, `openclaw.json` trong `.gitignore` |
+
+Ảnh nộp bài: màn hình đăng nhập có nút Keycloak · trang đăng nhập Keycloak · Element sau khi đăng nhập là Lan Nguyen · Lan hỏi bot trong phòng, bot trả lời.
