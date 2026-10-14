@@ -14,7 +14,7 @@ const db = new DatabaseSync(process.env.DB_PATH ?? 'tasks.db');
 
 // Mỗi câu SQL là 1 span "db.query" trên Jaeger (node:sqlite không có auto-instrumentation)
 const sql = (text) => {
-  const statement = text.replace(/s+/g, ' ').trim();
+  const statement = text.replace(/\s+/g, ' ').trim();
   const call = (method) => (...p) =>
     withSpanSync('db.query', { 'db.system': 'sqlite', 'db.name': 'tasks', 'db.statement': statement }, () => db.prepare(text)[method](...p));
   return { get: call('get'), all: call('all'), run: call('run') };
