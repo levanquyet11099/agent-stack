@@ -4,6 +4,7 @@ import DataLoader from 'dataloader';
 import express from 'express';
 import { GraphQLError, buildSchema } from 'graphql';
 import { createHandler } from 'graphql-http/lib/use/express';
+import { log as jlog } from './otel.js';
 
 const PORT = Number(process.env.PORT ?? 8000);
 const USER_API = process.env.USER_API_URL ?? 'http://localhost:8001';
@@ -11,7 +12,7 @@ const TASK_API = process.env.TASK_API_URL ?? 'http://localhost:8002';
 const API_KEY = process.env.API_KEY ?? 'dev-key';
 // Timeout tầng trên > tầng dưới: Task API → User API 5s, GraphQL → REST 15s, MCP → GraphQL 25s
 const TIMEOUT_MS = Number(process.env.UPSTREAM_TIMEOUT_MS ?? 15000);
-const log = (...a) => console.log(new Date().toISOString(), 'graphql', ...a);
+const log = (...a) => jlog('INFO', a.join(' '));
 
 /**
  * Gọi REST. GET 404 → null. Lỗi/timeout → GraphQLError có code rõ ràng,
@@ -33,6 +34,7 @@ async function restCall(method, base, path, { params = {}, body, headers = {} } 
     });
   } catch (e) {
     const timeout = e.name === 'TimeoutError';
+    jlog('ERROR', `REST ${method} ${url.pathname} thất bại: ${timeout ? 'timeout' : e.message}`, { service });
     throw new GraphQLError(timeout ? `${service} timeout` : `${service} không kết nối được`, {
       extensions: { code: timeout ? 'UPSTREAM_TIMEOUT' : 'UPSTREAM_UNAVAILABLE', service },
     });
