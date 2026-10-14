@@ -1,5 +1,15 @@
 name: agent-stack
 
+# OpenTelemetry dùng chung cho REST, GraphQL, MCP (Bài 4). Mỗi service tự đặt OTEL_SERVICE_NAME.
+x-otel: &otel
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+  OTEL_EXPORTER_OTLP_PROTOCOL: grpc
+  OTEL_TRACES_EXPORTER: otlp
+  OTEL_METRICS_EXPORTER: none
+  OTEL_LOGS_EXPORTER: none
+  OTEL_NODE_ENABLED_INSTRUMENTATIONS: http,express,graphql,undici
+  OTEL_NODE_RESOURCE_DETECTORS: env,host,os,process   # bỏ dò cloud (GCP/AWS) gây cảnh báo khi chạy local
+
 services:
   synapse:
     image: matrixdotorg/synapse:latest
@@ -22,8 +32,11 @@ services:
     ports: ["8001:8000"]
     volumes: ["./data:/data"]
     environment:
+      <<: *otel
+      OTEL_SERVICE_NAME: user-api
       API_KEY: ${API_KEY:-dev-key}
       DB_PATH: /data/users.db
+    depends_on: [jaeger]
 
   task-api:
     build: ./services/task-api
@@ -31,28 +44,34 @@ services:
     ports: ["8002:8000"]
     volumes: ["./data:/data"]
     environment:
+      <<: *otel
+      OTEL_SERVICE_NAME: task-api
       API_KEY: ${API_KEY:-dev-key}
       DB_PATH: /data/tasks.db
       USER_API_URL: http://user-api:8000
-    depends_on: [user-api]
+    depends_on: [user-api, jaeger]
 
   graphql:
     build: { context: ., dockerfile: services/graphql/Dockerfile }
     container_name: graphql
     ports: ["8003:8000"]
     environment:
+      <<: *otel
+      OTEL_SERVICE_NAME: graphql
       API_KEY: ${API_KEY:-dev-key}
       USER_API_URL: http://user-api:8000
       TASK_API_URL: http://task-api:8000
-    depends_on: [user-api, task-api]
+    depends_on: [user-api, task-api, jaeger]
 
   mcp:
     build: ./services/mcp
     container_name: mcp
     ports: ["8004:8000"]
     environment:
+      <<: *otel
+      OTEL_SERVICE_NAME: mcp
       GRAPHQL_URL: http://graphql:8000/graphql
-    depends_on: [graphql]
+    depends_on: [graphql, jaeger]
 
   openclaw:
     build: ./openclaw
@@ -63,6 +82,11 @@ services:
       - ./openclaw/workspace:/root/.openclaw/workspace                 # persona IDENTITY/SOUL/AGENTS/USER
     depends_on: [synapse, mcp]
     restart: unless-stopped
+
+  jaeger:
+    image: cr.jaegertracing.io/jaegertracing/jaeger:2.20.0
+    container_name: jaeger
+    ports: ['16686:16686', '4317:4317', '4318:4318']   # UI, OTLP gRPC, OTLP HTTP
 
   keycloak:
     image: quay.io/keycloak/keycloak:26.7.1

@@ -1,15 +1,24 @@
 import express from 'express';
 import { DatabaseSync } from 'node:sqlite';
+import { log as jlog, withSpanSync } from './otel.js';
 
 import { createHash } from 'node:crypto';
 
 const PORT = Number(process.env.PORT ?? 8000);
 const API_KEY = process.env.API_KEY ?? 'dev-key';
 const USER_API = process.env.USER_API_URL ?? 'http://localhost:8001';
-const log = (...a) => console.log(new Date().toISOString(), 'task-api', ...a);
+const log = (...a) => jlog('INFO', a.join(' '));
 const today = () => new Date().toISOString().slice(0, 10);
 
 const db = new DatabaseSync(process.env.DB_PATH ?? 'tasks.db');
+
+// Mỗi câu SQL là 1 span "db.query" trên Jaeger (node:sqlite không có auto-instrumentation)
+const sql = (text) => {
+  const statement = text.replace(/s+/g, ' ').trim();
+  const call = (method) => (...p) =>
+    withSpanSync('db.query', { 'db.system': 'sqlite', 'db.name': 'tasks', 'db.statement': statement }, () => db.prepare(text)[method](...p));
+  return { get: call('get'), all: call('all'), run: call('run') };
+};
 db.exec('CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY, title TEXT, status TEXT, assignee_id INTEGER, due_date TEXT)');
 const seed = db.prepare('INSERT OR IGNORE INTO tasks VALUES (?,?,?,?,?)');
 for (const t of [
@@ -100,7 +109,7 @@ app.post('/tasks', async (req, res) => {
   const requestHash = createHash('sha256').update(JSON.stringify(req.body ?? {})).digest('hex');
 
   if (key) {
-    const saved = db.prepare('SELECT * FROM idempotency WHERE key = ?').get(key);
+    const saved = sql('SELECT * FROM idempotency WHERE key = ?').get(key);
     if (saved) {
       if (saved.request_hash !== requestHash) throw new ApiError(409, 'IDEMPOTENCY_CONFLICT', 'Idempotency-Key đã dùng cho một yêu cầu khác');
       log(`POST /tasks replay key=${key}`);
@@ -108,22 +117,26 @@ app.post('/tasks', async (req, res) => {
     }
   }
 
-  const input = validateCreate(req.body);
+  const input = withSpanSync('validate_task', {}, () => validateCreate(req.body));
   if (!(await assigneeExists(input.assignee_id))) {
     throw new ApiError(422, 'ASSIGNEE_NOT_FOUND', `Không có user id=${input.assignee_id}`, [{ loc: ['body', 'assignee_id'], msg: 'không tồn tại' }]);
   }
 
   // Kiểm tra trùng + ghi trong cùng một đoạn đồng bộ (Node đơn luồng) nên không bị chen ngang
-  const dup = db.prepare("SELECT * FROM tasks WHERE assignee_id = ? AND status = 'open'").all(input.assignee_id)
-    .find((t) => normTitle(t.title) === normTitle(input.title));
+  const dup = withSpanSync('kiem_tra_trung', { 'task.assignee_id': input.assignee_id }, (span) => {
+    const found = sql("SELECT * FROM tasks WHERE assignee_id = ? AND status = 'open'").all(input.assignee_id)
+      .find((t) => normTitle(t.title) === normTitle(input.title));
+    span.setAttribute('task.duplicate', !!found);
+    return found;
+  });
   if (dup) {
     throw new ApiError(409, 'DUPLICATE_TASK', `Người này đã có task đang mở trùng tiêu đề (id=${dup.id})`, { existing_task: toTask(dup) });
   }
-  const { lastInsertRowid } = db.prepare("INSERT INTO tasks (title, status, assignee_id, due_date) VALUES (?, 'open', ?, ?)")
+  const { lastInsertRowid } = sql("INSERT INTO tasks (title, status, assignee_id, due_date) VALUES (?, 'open', ?, ?)")
     .run(input.title, input.assignee_id, input.due_date);
-  const created = toTask(db.prepare('SELECT * FROM tasks WHERE id = ?').get(Number(lastInsertRowid)));
+  const created = toTask(sql('SELECT * FROM tasks WHERE id = ?').get(Number(lastInsertRowid)));
   if (key) {
-    db.prepare('INSERT INTO idempotency VALUES (?, ?, ?, ?, ?)').run(key, requestHash, 201, JSON.stringify(created), new Date().toISOString());
+    sql('INSERT INTO idempotency VALUES (?, ?, ?, ?, ?)').run(key, requestHash, 201, JSON.stringify(created), new Date().toISOString());
   }
   log(`POST /tasks created id=${created.id} assignee=${created.assignee_id} key=${key ?? ''}`);
   res.status(201).set('Location', `/tasks/${created.id}`).json(created);
@@ -147,8 +160,8 @@ app.get('/tasks', (req, res) => {
     params.push(today());
   }
   const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
-  const { total } = db.prepare(`SELECT COUNT(*) AS total FROM tasks ${clause}`).get(...params);
-  const items = db.prepare(`SELECT * FROM tasks ${clause} ORDER BY due_date LIMIT ? OFFSET ?`).all(...params, pageSize, (page - 1) * pageSize);
+  const { total } = sql(`SELECT COUNT(*) AS total FROM tasks ${clause}`).get(...params);
+  const items = sql(`SELECT * FROM tasks ${clause} ORDER BY due_date LIMIT ? OFFSET ?`).all(...params, pageSize, (page - 1) * pageSize);
   log(`GET /tasks assignee=${assigneeId ?? ''} status=${status ?? ''} overdue=${overdue ?? ''} q=${q ?? ''} -> ${total}`);
   res.json({ items: items.map(toTask), total, page, page_size: pageSize });
 });
@@ -158,18 +171,21 @@ app.get('/tasks/stats', (req, res) => {
   const raw = req.query.assignee_ids;
   if (typeof raw !== 'string' || !/^\d+(,\d+){0,99}$/.test(raw)) throw invalid([{ loc: ['query', 'assignee_ids'], msg: 'bắt buộc, dạng 10,20' }]);
   const ids = [...new Set(raw.split(',').map(Number))];
-  const rows = db.prepare(
-    `SELECT assignee_id,
-            COUNT(*) AS total,
-            SUM(status = 'open') AS open,
-            SUM(status = 'done') AS done,
-            SUM(status = 'open' AND due_date < ?) AS overdue
-     FROM tasks WHERE assignee_id IN (${ids.map(() => '?').join(',')})
-     GROUP BY assignee_id`,
-  ).all(today(), ...ids);
-  const byId = new Map(rows.map((r) => [r.assignee_id, r]));
+  const items = withSpanSync('tinh_thong_ke', { 'stats.assignee_count': ids.length }, () => {
+    const rows = sql(
+      `SELECT assignee_id,
+              COUNT(*) AS total,
+              SUM(status = 'open') AS open,
+              SUM(status = 'done') AS done,
+              SUM(status = 'open' AND due_date < ?) AS overdue
+       FROM tasks WHERE assignee_id IN (${ids.map(() => '?').join(',')})
+       GROUP BY assignee_id`,
+    ).all(today(), ...ids);
+    const byId = new Map(rows.map((r) => [r.assignee_id, r]));
+    return ids.map((id) => byId.get(id) ?? { assignee_id: id, total: 0, open: 0, done: 0, overdue: 0 });
+  });
   log(`GET /tasks/stats ids=${ids}`);
-  res.json({ items: ids.map((id) => byId.get(id) ?? { assignee_id: id, total: 0, open: 0, done: 0, overdue: 0 }) });
+  res.json({ items });
 });
 
 // Xếp hạng người theo số task — nghiệp vụ ở REST, bot không tự đếm/so sánh
@@ -177,20 +193,22 @@ const RANK_BY = ['total', 'open', 'done', 'overdue'];
 app.get('/tasks/ranking', (req, res) => {
   const by = req.query.by ?? 'total';
   if (!RANK_BY.includes(by)) throw invalid([{ loc: ['query', 'by'], msg: RANK_BY.join(' | ') }]);
-  const rows = db.prepare(
-    `SELECT assignee_id,
-            COUNT(*) AS total,
-            SUM(status = 'open') AS open,
-            SUM(status = 'done') AS done,
-            SUM(status = 'open' AND due_date < ?) AS overdue
-     FROM tasks GROUP BY assignee_id`,
-  ).all(today());
-  rows.sort((a, b) => b[by] - a[by] || a.assignee_id - b.assignee_id);
-  // Dense rank: bằng điểm thì cùng hạng
-  let rank = 0, prev;
-  const items = rows.map((r) => {
-    if (r[by] !== prev) { rank += 1; prev = r[by]; }
-    return { rank, ...r };
+  const items = withSpanSync('xep_hang', { 'ranking.by': by }, () => {
+    const rows = sql(
+      `SELECT assignee_id,
+              COUNT(*) AS total,
+              SUM(status = 'open') AS open,
+              SUM(status = 'done') AS done,
+              SUM(status = 'open' AND due_date < ?) AS overdue
+       FROM tasks GROUP BY assignee_id`,
+    ).all(today());
+    rows.sort((a, b) => b[by] - a[by] || a.assignee_id - b.assignee_id);
+    // Dense rank: bằng điểm thì cùng hạng
+    let rank = 0, prev;
+    return rows.map((r) => {
+      if (r[by] !== prev) { rank += 1; prev = r[by]; }
+      return { rank, ...r };
+    });
   });
   log(`GET /tasks/ranking by=${by} -> ${items.length}`);
   res.json({ by, items });
@@ -199,7 +217,7 @@ app.get('/tasks/ranking', (req, res) => {
 app.get('/tasks/:id', (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id)) throw invalid([{ loc: ['path', 'id'], msg: 'phải là số nguyên' }]);
-  const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get(id);
+  const task = sql('SELECT * FROM tasks WHERE id = ?').get(id);
   log(`GET /tasks/${id} found=${!!task}`);
   if (!task) throw new ApiError(404, 'NOT_FOUND', `Không có task id=${id}`);
   res.json(toTask(task));
@@ -211,7 +229,7 @@ app.use((err, _req, res, _next) => {
   const e = err instanceof ApiError ? err
     : err.type === 'entity.parse.failed' ? new ApiError(400, 'INVALID_JSON', 'Body không phải JSON hợp lệ')
     : new ApiError(500, 'INTERNAL_ERROR', 'Lỗi hệ thống');
-  if (e.status >= 500) console.error(err);
+  if (e.status >= 500) jlog('ERROR', err.message, { stack: err.stack });
   res.status(e.status).json({ error: { code: e.code, message: e.message, details: e.details ?? null } });
 });
 
