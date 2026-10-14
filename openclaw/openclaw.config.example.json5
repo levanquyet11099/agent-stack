@@ -1,0 +1,25 @@
+// Phần cấu hình cần gộp vào file cấu hình OpenClaw (~/.openclaw/openclaw.json).
+// Kiểm tra tên khóa theo bản đang cài: `openclaw config schema`.
+{
+  channels: {
+    matrix: {
+      enabled: true,
+      homeserver: "http://localhost:8008",
+      userId: "@taskbot:localhost",
+      password: "<MATRIX_BOT_PASSWORD trong .env.local>", // không commit giá trị thật
+      encryption: false,            // phòng trong Element phải tắt E2EE
+      autoJoin: "always",           // tự nhận lời mời vào phòng
+      groupPolicy: "allowlist",
+      groupAllowFrom: ["@admin:localhost"],
+      dm: { policy: "allowlist", allowFrom: ["@admin:localhost"] },
+    },
+  },
+  mcp: {
+    servers: {
+      "task-assistant": {
+        url: "http://localhost:8004/mcp", // không có dấu / cuối
+        transport: "streamable-http",
+      },
+    },
+  },
+}

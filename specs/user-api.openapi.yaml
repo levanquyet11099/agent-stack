@@ -1,0 +1,121 @@
+openapi: 3.1.0
+info:
+  title: User API
+  version: 1.0.0
+  description: Quản lý người dùng (nhân viên) được giao task.
+  license:
+    name: Internal
+    identifier: LicenseRef-Internal
+servers:
+  - url: http://localhost:8001
+security:
+  - ApiKeyAuth: []
+tags:
+  - name: users
+    description: Người dùng được giao task
+paths:
+  /users:
+    get:
+      tags: [users]
+      operationId: listUsers
+      summary: Danh sách user, tìm theo tên hoặc lấy theo nhiều id
+      description: |
+        - `q`: tìm không phân biệt hoa thường, không dấu, theo tên.
+        - `ids`: lấy nhiều user một lần (dùng cho DataLoader của GraphQL). Tối đa 100 id.
+      parameters:
+        - name: q
+          in: query
+          schema: { type: string, maxLength: 100 }
+        - name: ids
+          in: query
+          description: Danh sách id, phân tách bằng dấu phẩy. Ví dụ `10,20`
+          schema: { type: string, pattern: '^\d+(,\d+){0,99}$' }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+  /users/{id}:
+    get:
+      tags: [users]
+      operationId: getUser
+      summary: Lấy một user theo id
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+  parameters:
+    Page:
+      name: page
+      in: query
+      schema: { type: integer, minimum: 1, default: 1 }
+    PageSize:
+      name: page_size
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+  schemas:
+    User:
+      type: object
+      required: [id, name, email, department]
+      properties:
+        id: { type: integer, examples: [10] }
+        name: { type: string, examples: [Lan] }
+        email: { type: string, format: email }
+        department: { type: string, examples: [Backend] }
+    UserPage:
+      type: object
+      required: [items, total, page, page_size]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/User' }
+        total: { type: integer }
+        page: { type: integer }
+        page_size: { type: integer }
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string, examples: [NOT_FOUND] }
+            message: { type: string }
+            details: {}
+  responses:
+    Unauthorized:
+      description: Thiếu hoặc sai X-API-Key
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Không tìm thấy
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ValidationError:
+      description: Tham số không hợp lệ
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }

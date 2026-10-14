@@ -1,0 +1,66 @@
+name: agent-stack
+
+services:
+  synapse:
+    image: matrixdotorg/synapse:latest
+    container_name: synapse
+    ports: ["8008:8008"]
+    volumes: ["./synapse-data:/data"]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    restart: unless-stopped
+
+  element:
+    image: vectorim/element-web:latest
+    container_name: element
+    ports: ["8080:80"]
+    volumes: ["./element/config.json:/app/config.json:ro"]
+    depends_on: [synapse]
+
+  user-api:
+    build: ./services/user-api
+    container_name: user-api
+    ports: ["8001:8000"]
+    volumes: ["./data:/data"]
+    environment:
+      API_KEY: ${API_KEY:-dev-key}
+      DB_PATH: /data/users.db
+
+  task-api:
+    build: ./services/task-api
+    container_name: task-api
+    ports: ["8002:8000"]
+    volumes: ["./data:/data"]
+    environment:
+      API_KEY: ${API_KEY:-dev-key}
+      DB_PATH: /data/tasks.db
+
+  graphql:
+    build: { context: ., dockerfile: services/graphql/Dockerfile }
+    container_name: graphql
+    ports: ["8003:8000"]
+    environment:
+      API_KEY: ${API_KEY:-dev-key}
+      USER_API_URL: http://user-api:8000
+      TASK_API_URL: http://task-api:8000
+    depends_on: [user-api, task-api]
+
+  mcp:
+    build: ./services/mcp
+    container_name: mcp
+    ports: ["8004:8000"]
+    environment:
+      GRAPHQL_URL: http://graphql:8000/graphql
+    depends_on: [graphql]
+
+  openclaw:
+    build: ./openclaw
+    container_name: openclaw
+    volumes:
+      - openclaw-data:/root/.openclaw                                  # trạng thái, plugin, session
+      - ./openclaw/openclaw.json:/root/.openclaw/openclaw.json         # cấu hình (bí mật, không commit)
+      - ./openclaw/workspace:/root/.openclaw/workspace                 # persona IDENTITY/SOUL/AGENTS/USER
+    depends_on: [synapse, mcp]
+    restart: unless-stopped
+
+volumes:
+  openclaw-data:

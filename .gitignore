@@ -1,0 +1,8 @@
+synapse-data/
+.env
+.env.local
+__pycache__/
+*.db
+node_modules/
+data/
+openclaw/openclaw.json

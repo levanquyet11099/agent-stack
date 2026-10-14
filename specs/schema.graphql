@@ -1,0 +1,73 @@
+# GraphQL schema (schema-first). Resolver chỉ gọi REST và ghép dữ liệu.
+
+enum TaskStatus {
+  OPEN
+  DONE
+}
+
+type User {
+  id: ID!
+  name: String!
+  email: String!
+  department: String!
+  "Task của user này — gọi Task API"
+  tasks(status: TaskStatus, page: Int = 1, pageSize: Int = 20): TaskPage
+  "Số liệu do Task API tính — gom bằng DataLoader"
+  taskStats: TaskStats
+}
+
+type Task {
+  id: ID!
+  title: String!
+  status: TaskStatus!
+  dueDate: String!
+  overdue: Boolean!
+  "Người được giao — gọi User API (DataLoader, tránh N+1)"
+  assignee: User
+}
+
+enum RankBy {
+  TOTAL
+  OPEN
+  DONE
+  OVERDUE
+}
+
+"Một dòng xếp hạng — số liệu và hạng do Task API tính"
+type RankingEntry {
+  rank: Int!
+  assignee: User
+  total: Int!
+  open: Int!
+  done: Int!
+  overdue: Int!
+}
+
+type TaskStats {
+  total: Int!
+  open: Int!
+  done: Int!
+  overdue: Int!
+}
+
+type UserPage {
+  items: [User!]!
+  total: Int!
+  page: Int!
+  pageSize: Int!
+}
+
+type TaskPage {
+  items: [Task!]!
+  total: Int!
+  page: Int!
+  pageSize: Int!
+}
+
+type Query {
+  users(search: String, page: Int = 1, pageSize: Int = 20): UserPage!
+  user(id: ID!): User
+  tasks(status: TaskStatus, assigneeId: ID, overdue: Boolean, search: String, page: Int = 1, pageSize: Int = 20): TaskPage!
+  taskRanking(by: RankBy = TOTAL): [RankingEntry!]!
+  task(id: ID!): Task
+}

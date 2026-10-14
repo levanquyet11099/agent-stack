@@ -1,0 +1,199 @@
+openapi: 3.1.0
+info:
+  title: Task API
+  version: 1.0.0
+  description: |
+    Quản lý task. Mỗi task gán cho một user (assignee_id tham chiếu tới User API).
+    Mọi số liệu tổng hợp (đếm, quá hạn) do API này tính.
+  license:
+    name: Internal
+    identifier: LicenseRef-Internal
+servers:
+  - url: http://localhost:8002
+security:
+  - ApiKeyAuth: []
+tags:
+  - name: tasks
+    description: Task và thống kê task
+paths:
+  /tasks:
+    get:
+      tags: [tasks]
+      operationId: listTasks
+      summary: Danh sách task, lọc theo người được giao, trạng thái, từ khóa
+      parameters:
+        - name: assignee_id
+          in: query
+          schema: { type: integer }
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/TaskStatus' }
+        - name: overdue
+          in: query
+          description: true = chỉ task quá hạn (open và due_date < hôm nay), false = loại task quá hạn
+          schema: { type: boolean }
+        - name: q
+          in: query
+          description: Tìm trong tiêu đề, không phân biệt hoa thường
+          schema: { type: string, maxLength: 100 }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+  /tasks/stats:
+    get:
+      tags: [tasks]
+      operationId: getTaskStats
+      summary: Thống kê task (tổng, đang mở, đã xong, quá hạn)
+      description: Truyền `assignee_ids` để lấy thống kê cho nhiều người một lần.
+      parameters:
+        - name: assignee_ids
+          in: query
+          required: true
+          schema: { type: string, pattern: '^\d+(,\d+){0,99}$' }
+      responses:
+        '200':
+          description: Mỗi phần tử ứng với một assignee_id được hỏi (kể cả khi 0 task)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/TaskStats' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+  /tasks/ranking:
+    get:
+      tags: [tasks]
+      operationId: getTaskRanking
+      summary: Xếp hạng người được giao theo số task
+      description: Sắp giảm dần theo tiêu chí `by`. Bằng điểm thì cùng hạng (dense rank). Chỉ gồm người có ít nhất 1 task.
+      parameters:
+        - name: by
+          in: query
+          schema: { type: string, enum: [total, open, done, overdue], default: total }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [by, items]
+                properties:
+                  by: { type: string }
+                  items:
+                    type: array
+                    items:
+                      allOf:
+                        - $ref: '#/components/schemas/TaskStats'
+                        - type: object
+                          required: [rank]
+                          properties:
+                            rank: { type: integer, minimum: 1 }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+  /tasks/{id}:
+    get:
+      tags: [tasks]
+      operationId: getTask
+      summary: Lấy một task theo id
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Task' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+  parameters:
+    Page:
+      name: page
+      in: query
+      schema: { type: integer, minimum: 1, default: 1 }
+    PageSize:
+      name: page_size
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+  schemas:
+    TaskStatus:
+      type: string
+      enum: [open, done]
+    Task:
+      type: object
+      required: [id, title, status, assignee_id, due_date, overdue]
+      properties:
+        id: { type: integer }
+        title: { type: string }
+        status: { $ref: '#/components/schemas/TaskStatus' }
+        assignee_id: { type: integer }
+        due_date: { type: string, format: date }
+        overdue:
+          type: boolean
+          description: true nếu status=open và due_date < hôm nay
+    TaskPage:
+      type: object
+      required: [items, total, page, page_size]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Task' }
+        total: { type: integer }
+        page: { type: integer }
+        page_size: { type: integer }
+    TaskStats:
+      type: object
+      required: [assignee_id, total, open, done, overdue]
+      properties:
+        assignee_id: { type: integer }
+        total: { type: integer }
+        open: { type: integer }
+        done: { type: integer }
+        overdue: { type: integer }
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string, examples: [NOT_FOUND] }
+            message: { type: string }
+            details: {}
+  responses:
+    Unauthorized:
+      description: Thiếu hoặc sai X-API-Key
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Không tìm thấy
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ValidationError:
+      description: Tham số không hợp lệ
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
