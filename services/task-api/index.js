@@ -1,8 +1,11 @@
 import express from 'express';
 import { DatabaseSync } from 'node:sqlite';
 
+import { createHash } from 'node:crypto';
+
 const PORT = Number(process.env.PORT ?? 8000);
 const API_KEY = process.env.API_KEY ?? 'dev-key';
+const USER_API = process.env.USER_API_URL ?? 'http://localhost:8001';
 const log = (...a) => console.log(new Date().toISOString(), 'task-api', ...a);
 const today = () => new Date().toISOString().slice(0, 10);
 
@@ -20,6 +23,8 @@ for (const t of [
   [8, 'Thêm index cho bảng orders', 'open', 10, '2026-11-01'],
   [9, 'Cấu hình backup', 'done', 50, '2026-10-02'],
 ]) seed.run(...t);
+// Lưu kết quả theo Idempotency-Key: gửi lại cùng key → trả lại đúng kết quả cũ, không tạo thêm
+db.exec('CREATE TABLE IF NOT EXISTS idempotency (key TEXT PRIMARY KEY, request_hash TEXT, status INTEGER, body TEXT, created_at TEXT)');
 
 class ApiError extends Error {
   constructor(status, code, message, details) {
@@ -46,6 +51,82 @@ app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 app.use((req, _res, next) => {
   if (req.get('X-API-Key') !== API_KEY) throw new ApiError(401, 'UNAUTHORIZED', 'Thiếu hoặc sai X-API-Key');
   next();
+});
+app.use(express.json());
+
+// So trùng tiêu đề: không phân biệt hoa thường, gộp khoảng trắng
+const normTitle = (s) => s.normalize('NFC').trim().replace(/\s+/g, ' ').toLowerCase();
+
+// "2026-02-30", "2026-13-01" khớp regex nhưng không phải ngày thật
+const isRealDate = (s) => {
+  const d = new Date(`${s}T00:00:00Z`);
+  return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === s;
+};
+
+function validateCreate(body) {
+  const errors = [];
+  const b = body && typeof body === 'object' ? body : {};
+  const title = typeof b.title === 'string' ? b.title.trim().replace(/\s+/g, ' ') : undefined;
+  if (title === undefined || title === '') errors.push({ loc: ['body', 'title'], msg: 'bắt buộc' });
+  else if (title.length < 3 || title.length > 200) errors.push({ loc: ['body', 'title'], msg: 'dài 3–200 ký tự' });
+
+  if (b.assignee_id === undefined) errors.push({ loc: ['body', 'assignee_id'], msg: 'bắt buộc' });
+  else if (!Number.isInteger(b.assignee_id) || b.assignee_id < 1) errors.push({ loc: ['body', 'assignee_id'], msg: 'phải là số nguyên dương' });
+
+  if (b.due_date === undefined) errors.push({ loc: ['body', 'due_date'], msg: 'bắt buộc' });
+  else if (typeof b.due_date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(b.due_date) || !isRealDate(b.due_date)) {
+    errors.push({ loc: ['body', 'due_date'], msg: 'ngày không hợp lệ, định dạng YYYY-MM-DD' });
+  } else if (b.due_date < today()) errors.push({ loc: ['body', 'due_date'], msg: `không được ở quá khứ (hôm nay ${today()})` });
+
+  if (errors.length) throw invalid(errors);
+  return { title, assignee_id: b.assignee_id, due_date: b.due_date };
+}
+
+async function assigneeExists(id) {
+  let r;
+  try {
+    r = await fetch(`${USER_API}/users/${id}`, { headers: { 'X-API-Key': API_KEY }, signal: AbortSignal.timeout(5000) });
+  } catch {
+    throw new ApiError(503, 'UPSTREAM_UNAVAILABLE', 'Không kiểm tra được người được giao (User API không phản hồi)');
+  }
+  if (r.status === 404) return false;
+  if (!r.ok) throw new ApiError(503, 'UPSTREAM_ERROR', `User API lỗi ${r.status}`);
+  return true;
+}
+
+app.post('/tasks', async (req, res) => {
+  const key = req.get('Idempotency-Key');
+  if (key !== undefined && !/^[\w-]{8,100}$/.test(key)) throw invalid([{ loc: ['header', 'Idempotency-Key'], msg: '8–100 ký tự chữ, số, - hoặc _' }]);
+  const requestHash = createHash('sha256').update(JSON.stringify(req.body ?? {})).digest('hex');
+
+  if (key) {
+    const saved = db.prepare('SELECT * FROM idempotency WHERE key = ?').get(key);
+    if (saved) {
+      if (saved.request_hash !== requestHash) throw new ApiError(409, 'IDEMPOTENCY_CONFLICT', 'Idempotency-Key đã dùng cho một yêu cầu khác');
+      log(`POST /tasks replay key=${key}`);
+      return res.status(saved.status).set('Idempotent-Replay', 'true').json(JSON.parse(saved.body));
+    }
+  }
+
+  const input = validateCreate(req.body);
+  if (!(await assigneeExists(input.assignee_id))) {
+    throw new ApiError(422, 'ASSIGNEE_NOT_FOUND', `Không có user id=${input.assignee_id}`, [{ loc: ['body', 'assignee_id'], msg: 'không tồn tại' }]);
+  }
+
+  // Kiểm tra trùng + ghi trong cùng một đoạn đồng bộ (Node đơn luồng) nên không bị chen ngang
+  const dup = db.prepare("SELECT * FROM tasks WHERE assignee_id = ? AND status = 'open'").all(input.assignee_id)
+    .find((t) => normTitle(t.title) === normTitle(input.title));
+  if (dup) {
+    throw new ApiError(409, 'DUPLICATE_TASK', `Người này đã có task đang mở trùng tiêu đề (id=${dup.id})`, { existing_task: toTask(dup) });
+  }
+  const { lastInsertRowid } = db.prepare("INSERT INTO tasks (title, status, assignee_id, due_date) VALUES (?, 'open', ?, ?)")
+    .run(input.title, input.assignee_id, input.due_date);
+  const created = toTask(db.prepare('SELECT * FROM tasks WHERE id = ?').get(Number(lastInsertRowid)));
+  if (key) {
+    db.prepare('INSERT INTO idempotency VALUES (?, ?, ?, ?, ?)').run(key, requestHash, 201, JSON.stringify(created), new Date().toISOString());
+  }
+  log(`POST /tasks created id=${created.id} assignee=${created.assignee_id} key=${key ?? ''}`);
+  res.status(201).set('Location', `/tasks/${created.id}`).json(created);
 });
 
 app.get('/tasks', (req, res) => {
@@ -127,7 +208,9 @@ app.get('/tasks/:id', (req, res) => {
 app.use((_req, _res) => { throw new ApiError(404, 'NOT_FOUND', 'Endpoint không tồn tại'); });
 
 app.use((err, _req, res, _next) => {
-  const e = err instanceof ApiError ? err : new ApiError(500, 'INTERNAL_ERROR', 'Lỗi hệ thống');
+  const e = err instanceof ApiError ? err
+    : err.type === 'entity.parse.failed' ? new ApiError(400, 'INVALID_JSON', 'Body không phải JSON hợp lệ')
+    : new ApiError(500, 'INTERNAL_ERROR', 'Lỗi hệ thống');
   if (e.status >= 500) console.error(err);
   res.status(e.status).json({ error: { code: e.code, message: e.message, details: e.details ?? null } });
 });

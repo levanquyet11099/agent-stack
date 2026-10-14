@@ -1,5 +1,6 @@
 // MCP server (Streamable HTTP, stateless) bọc GraphQL thành tool cho OpenClaw.
 // Endpoint: http://localhost:8004/mcp  (không có dấu / cuối)
+import { createHash } from 'node:crypto';
 import express from 'express';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
@@ -17,7 +18,7 @@ async function gql(query, variables) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ query, variables }),
-      signal: AbortSignal.timeout(10_000),
+      signal: AbortSignal.timeout(25_000), // > timeout GraphQL → REST (15s)
     });
     body = await res.json();
   } catch (e) {
@@ -145,6 +146,63 @@ function buildServer() {
       if (!res.ok) return result(res);
       if (!res.data.task) return result({ ok: true, found: false, message: `Không có task id=${taskId}.` });
       return result({ ok: true, found: true, task: res.data.task });
+    },
+  );
+
+  server.registerTool(
+    'create_task',
+    {
+      description:
+        'Tạo task mới cho một thành viên. GHI DỮ LIỆU THẬT — làm đúng thứ tự: ' +
+        '(1) Cần đủ 3 thông tin từ user: tiêu đề, tên người được giao, hạn chót. Thiếu cái nào thì HỎI LẠI user, ' +
+        'không tự đặt tiêu đề, không tự chọn người, không tự chọn ngày. ' +
+        '(2) Tóm tắt lại cho user (tiêu đề, người được giao, hạn chót dạng YYYY-MM-DD) và hỏi "Xác nhận tạo không?". ' +
+        '(3) CHỈ gọi tool này sau khi user trả lời đồng ý rõ ràng (có/ok/đồng ý), với confirmed=true. ' +
+        'User từ chối hoặc muốn sửa thì KHÔNG gọi. ' +
+        'Kết quả: created=true là đã tạo. ok=false kèm code: VALIDATION_ERROR (dữ liệu sai, xem details), ' +
+        'ASSIGNEE_NOT_FOUND / AMBIGUOUS_ASSIGNEE (không tìm thấy / nhiều người trùng tên → hỏi lại user), ' +
+        'DUPLICATE_TASK (người đó đã có task đang mở trùng tiêu đề, xem details.existing_task). ' +
+        'Báo đúng lý do cho user, không tự sửa dữ liệu rồi gọi lại.',
+      inputSchema: {
+        title: z.string().describe('Tiêu đề task, đúng như user nói'),
+        assigneeName: z.string().describe('Tên người được giao, ví dụ "Nam"'),
+        dueDate: z.string().describe('Hạn chót dạng YYYY-MM-DD. User nói ngày tương đối ("thứ 6 tuần sau") thì quy đổi và đưa vào bước xác nhận'),
+        confirmed: z.literal(true).describe('Chỉ đặt true sau khi user đã đồng ý bản tóm tắt'),
+      },
+    },
+    async ({ title, assigneeName, dueDate }) => {
+      // 1. Tìm người được giao theo tên (tra cứu, không phải nghiệp vụ)
+      const found = await gql(`query($s: String!) { users(search: $s, pageSize: 5) { total items { id name department } } }`, { s: assigneeName });
+      if (!found.ok) return result(found);
+      const { total, items } = found.data.users;
+      if (total === 0) {
+        return result({ ok: false, code: 'ASSIGNEE_NOT_FOUND', error: `Không có thành viên nào tên '${assigneeName}'. Hỏi lại user tên người được giao.` });
+      }
+      if (total > 1) {
+        return result({ ok: false, code: 'AMBIGUOUS_ASSIGNEE', error: `Có ${total} người khớp tên '${assigneeName}'. Hỏi user chọn đúng người.`, candidates: items });
+      }
+      const assignee = items[0];
+
+      // 2. Idempotency-Key theo nội dung + khung 10 phút: agent retry khi timeout sẽ không tạo bản ghi thứ hai
+      const window = Math.floor(Date.now() / 600_000);
+      const idempotencyKey = 'mcp-' + createHash('sha256').update(`${title}|${assignee.id}|${dueDate}|${window}`).digest('hex').slice(0, 40);
+
+      // 3. Gọi mutation — validation, chống trùng do Task API làm
+      const res = await gql(
+        `mutation($in: CreateTaskInput!, $key: String) {
+          createTask(input: $in, idempotencyKey: $key) { id title status dueDate overdue assignee { name department } }
+        }`,
+        { in: { title, assigneeId: String(assignee.id), dueDate }, key: idempotencyKey },
+      );
+      if (!res.ok) {
+        const err = res.details?.[0];
+        const userErrors = ['VALIDATION_ERROR', 'ASSIGNEE_NOT_FOUND', 'DUPLICATE_TASK', 'IDEMPOTENCY_CONFLICT', 'BAD_REQUEST'];
+        if (err && userErrors.includes(err.code)) {
+          return result({ ok: false, code: err.code, error: err.message, details: err.details ?? null });
+        }
+        return result(res); // lỗi hệ thống
+      }
+      return result({ ok: true, created: true, task: res.data.createTask });
     },
   );
 

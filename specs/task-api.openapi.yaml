@@ -46,6 +46,219 @@ paths:
               schema: { $ref: '#/components/schemas/TaskPage' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '422': { $ref: '#/components/responses/ValidationError' }
+    post:
+      tags: [tasks]
+      operationId: createTask
+      summary: Tạo task mới
+      description: |
+        - Người được giao phải tồn tại (Task API kiểm tra qua User API).
+        - Chống trùng: không cho tạo task trùng tiêu đề (không phân biệt hoa thường, khoảng trắng) với một task **đang mở** của cùng người.
+        - Gửi kèm `Idempotency-Key` để retry an toàn: cùng key + cùng body → trả lại đúng kết quả lần đầu (header `Idempotent-Replay: true`), không tạo thêm.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema: { type: string, pattern: '^[w-]{8,100}
+    get:
+      tags: [tasks]
+      operationId: getTaskStats
+      summary: Thống kê task (tổng, đang mở, đã xong, quá hạn)
+      description: Truyền `assignee_ids` để lấy thống kê cho nhiều người một lần.
+      parameters:
+        - name: assignee_ids
+          in: query
+          required: true
+          schema: { type: string, pattern: '^\d+(,\d+){0,99}$' }
+      responses:
+        '200':
+          description: Mỗi phần tử ứng với một assignee_id được hỏi (kể cả khi 0 task)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/TaskStats' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+  /tasks/ranking:
+    get:
+      tags: [tasks]
+      operationId: getTaskRanking
+      summary: Xếp hạng người được giao theo số task
+      description: Sắp giảm dần theo tiêu chí `by`. Bằng điểm thì cùng hạng (dense rank). Chỉ gồm người có ít nhất 1 task.
+      parameters:
+        - name: by
+          in: query
+          schema: { type: string, enum: [total, open, done, overdue], default: total }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [by, items]
+                properties:
+                  by: { type: string }
+                  items:
+                    type: array
+                    items:
+                      allOf:
+                        - $ref: '#/components/schemas/TaskStats'
+                        - type: object
+                          required: [rank]
+                          properties:
+                            rank: { type: integer, minimum: 1 }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+  /tasks/{id}:
+    get:
+      tags: [tasks]
+      operationId: getTask
+      summary: Lấy một task theo id
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Task' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+  parameters:
+    Page:
+      name: page
+      in: query
+      schema: { type: integer, minimum: 1, default: 1 }
+    PageSize:
+      name: page_size
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+  schemas:
+    TaskStatus:
+      type: string
+      enum: [open, done]
+    Task:
+      type: object
+      required: [id, title, status, assignee_id, due_date, overdue]
+      properties:
+        id: { type: integer }
+        title: { type: string }
+        status: { $ref: '#/components/schemas/TaskStatus' }
+        assignee_id: { type: integer }
+        due_date: { type: string, format: date }
+        overdue:
+          type: boolean
+          description: true nếu status=open và due_date < hôm nay
+    CreateTaskInput:
+      type: object
+      required: [title, assignee_id, due_date]
+      properties:
+        title: { type: string, minLength: 3, maxLength: 200, examples: [Viết tài liệu deploy] }
+        assignee_id: { type: integer, minimum: 1, examples: [20] }
+        due_date:
+          type: string
+          format: date
+          description: Không được ở quá khứ
+          examples: ['2026-10-30']
+    TaskPage:
+      type: object
+      required: [items, total, page, page_size]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Task' }
+        total: { type: integer }
+        page: { type: integer }
+        page_size: { type: integer }
+    TaskStats:
+      type: object
+      required: [assignee_id, total, open, done, overdue]
+      properties:
+        assignee_id: { type: integer }
+        total: { type: integer }
+        open: { type: integer }
+        done: { type: integer }
+        overdue: { type: integer }
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string, examples: [NOT_FOUND] }
+            message: { type: string }
+            details: {}
+  responses:
+    Unauthorized:
+      description: Thiếu hoặc sai X-API-Key
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Không tìm thấy
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ValidationError:
+      description: Tham số không hợp lệ
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+ }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateTaskInput' }
+      responses:
+        '201':
+          description: Đã tạo (hoặc replay theo Idempotency-Key)
+          headers:
+            Location:
+              schema: { type: string }
+            Idempotent-Replay:
+              description: true nếu đây là kết quả lưu lại của một lần gửi trước
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Task' }
+        '400':
+          description: Body không phải JSON hợp lệ (INVALID_JSON)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409':
+          description: DUPLICATE_TASK (details.existing_task là task trùng) hoặc IDEMPOTENCY_CONFLICT (key đã dùng cho body khác)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: VALIDATION_ERROR (details liệt kê từng trường lỗi) hoặc ASSIGNEE_NOT_FOUND
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: Không kiểm tra được người được giao vì User API lỗi (UPSTREAM_UNAVAILABLE, UPSTREAM_ERROR)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
   /tasks/stats:
     get:
       tags: [tasks]

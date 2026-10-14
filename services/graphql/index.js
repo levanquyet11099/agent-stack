@@ -9,33 +9,49 @@ const PORT = Number(process.env.PORT ?? 8000);
 const USER_API = process.env.USER_API_URL ?? 'http://localhost:8001';
 const TASK_API = process.env.TASK_API_URL ?? 'http://localhost:8002';
 const API_KEY = process.env.API_KEY ?? 'dev-key';
-const TIMEOUT_MS = Number(process.env.UPSTREAM_TIMEOUT_MS ?? 5000);
+// Timeout tầng trên > tầng dưới: Task API → User API 5s, GraphQL → REST 15s, MCP → GraphQL 25s
+const TIMEOUT_MS = Number(process.env.UPSTREAM_TIMEOUT_MS ?? 15000);
 const log = (...a) => console.log(new Date().toISOString(), 'graphql', ...a);
 
-/** GET tới REST. 404 → null. Lỗi/timeout → GraphQLError có code rõ ràng. */
-async function restGet(base, path, params = {}) {
+/**
+ * Gọi REST. GET 404 → null. Lỗi/timeout → GraphQLError có code rõ ràng,
+ * giữ nguyên code + details của REST (lỗi validation, task trùng...) để MCP báo lại cho user.
+ */
+async function restCall(method, base, path, { params = {}, body, headers = {} } = {}) {
   const service = base === USER_API ? 'user-api' : 'task-api';
   const url = new URL(path, base);
   for (const [k, v] of Object.entries(params)) if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
-  log(`-> REST GET ${url.pathname}${url.search}`); // log từng lượt gọi để soi N+1
+  log(`-> REST ${method} ${url.pathname}${url.search}`); // log từng lượt gọi để soi N+1
 
   let res;
   try {
-    res = await fetch(url, { headers: { 'X-API-Key': API_KEY }, signal: AbortSignal.timeout(TIMEOUT_MS) });
+    res = await fetch(url, {
+      method,
+      headers: { 'X-API-Key': API_KEY, ...(body ? { 'Content-Type': 'application/json' } : {}), ...headers },
+      body: body ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    });
   } catch (e) {
     const timeout = e.name === 'TimeoutError';
     throw new GraphQLError(timeout ? `${service} timeout` : `${service} không kết nối được`, {
       extensions: { code: timeout ? 'UPSTREAM_TIMEOUT' : 'UPSTREAM_UNAVAILABLE', service },
     });
   }
-  if (res.status === 404) return null;
-  if (res.status >= 500) throw new GraphQLError(`${service} lỗi ${res.status}`, { extensions: { code: 'UPSTREAM_ERROR', service } });
-  const body = await res.json();
-  if (res.status >= 400) {
-    throw new GraphQLError(body.error?.message ?? 'Bad request', { extensions: { code: body.error?.code ?? 'BAD_REQUEST', service } });
+  if (res.status === 404 && method === 'GET') return null;
+  const data = await res.json().catch(() => null);
+  if (res.status >= 500) {
+    throw new GraphQLError(data?.error?.message ?? `${service} lỗi ${res.status}`, {
+      extensions: { code: data?.error?.code ?? 'UPSTREAM_ERROR', service },
+    });
   }
-  return body;
+  if (res.status >= 400) {
+    throw new GraphQLError(data?.error?.message ?? 'Bad request', {
+      extensions: { code: data?.error?.code ?? 'BAD_REQUEST', service, details: data?.error?.details ?? null },
+    });
+  }
+  return data;
 }
+const restGet = (base, path, params) => restCall('GET', base, path, { params });
 
 // REST trả snake_case + page_size → đổi sang shape của schema
 const toPage = (p) => ({ items: p.items, total: p.total, page: p.page, pageSize: p.page_size });
@@ -64,6 +80,14 @@ const resolvers = {
       toPage(await restGet(TASK_API, '/tasks', { status: STATUS_IN[status], assignee_id: assigneeId, overdue, q: search, page, page_size: pageSize })),
     taskRanking: async (_, { by }) => (await restGet(TASK_API, '/tasks/ranking', { by: by.toLowerCase() })).items,
     task: (_, { id }) => restGet(TASK_API, `/tasks/${Number(id)}`),
+  },
+  Mutation: {
+    // Chỉ đổi tên field và chuyển tiếp — validation, kiểm tra người tồn tại, chống trùng đều ở Task API
+    createTask: (_, { input, idempotencyKey }) =>
+      restCall('POST', TASK_API, '/tasks', {
+        body: { title: input.title, assignee_id: Number(input.assigneeId), due_date: input.dueDate },
+        headers: idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : {},
+      }),
   },
   User: {
     tasks: async (user, { status, page, pageSize }) =>

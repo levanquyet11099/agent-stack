@@ -127,3 +127,95 @@ sequenceDiagram
 | 3 | Task của Tuấn? | Không có dữ liệu, không bịa |
 | 4 | Task số 999? | Không có task này |
 | 5 | (`docker compose stop task-api`) Những việc nào đang mở? | Bot báo hệ thống lỗi |
+
+---
+
+# Bài 2 — Bot tạo dữ liệu qua chat
+
+Luồng ghi: `User → OpenClaw → MCP create_task → GraphQL mutation createTask → REST POST /tasks → SQLite`
+
+## Các lớp bảo vệ
+
+| Rủi ro | Chặn ở đâu | Cách chặn |
+|---|---|---|
+| Bot ghi khi user chưa đồng ý | Persona + MCP | SOUL.md bắt tóm tắt và hỏi xác nhận. Tham số `confirmed` của tool chỉ nhận `true` (zod `literal(true)`) |
+| Bot tự điền thông tin thiếu | Persona + MCP + REST | Persona bắt hỏi lại. Tool bắt buộc đủ 3 trường. REST trả 422 nếu thiếu hoặc sai |
+| Giao nhầm người | MCP + REST | MCP tra tên: 0 người → `ASSIGNEE_NOT_FOUND`, nhiều người → `AMBIGUOUS_ASSIGNEE`. REST kiểm tra lại id qua User API |
+| Tạo trùng khi agent retry | REST (`Idempotency-Key`) | MCP sinh key từ nội dung + khung 10 phút. Gửi lại cùng key thì REST trả kết quả cũ (`Idempotent-Replay: true`) |
+| Tạo trùng do user nhập lại | REST | Task đang mở cùng người, trùng tiêu đề (không phân biệt hoa thường, khoảng trắng) → `409 DUPLICATE_TASK` |
+| Dữ liệu sai định dạng | REST | Tiêu đề 3–200 ký tự, ngày phải có thật và không ở quá khứ → `422 VALIDATION_ERROR`, `details` chỉ rõ trường lỗi |
+
+## Sequence — tạo thành công có xác nhận
+
+```mermaid
+sequenceDiagram
+  actor U as User
+  participant O as OpenClaw
+  participant L as LLM
+  participant M as MCP
+  participant G as GraphQL
+  participant TA as Task API
+  participant UA as User API
+
+  U->>O: "Giao cho Nam viết tài liệu API, hạn 30/10"
+  O->>L: prompt + tools
+  L-->>O: (không gọi tool) "Tạo task: Viết tài liệu API — Nam — 2026-10-30. Xác nhận?"
+  O-->>U: tóm tắt + hỏi xác nhận
+  U->>O: "ok"
+  O->>L: lịch sử + "ok"
+  L-->>O: create_task(title, assigneeName="Nam", dueDate, confirmed=true)
+  O->>M: tools/call
+  M->>G: query users(search:"Nam")
+  G->>UA: GET /users?q=Nam
+  UA-->>G: [Nam id=20]
+  G-->>M: 1 người
+  M->>G: mutation createTask(input, idempotencyKey)
+  G->>TA: POST /tasks + Idempotency-Key
+  TA->>UA: GET /users/20 (người được giao có tồn tại?)
+  UA-->>TA: 200
+  TA->>TA: validate, kiểm tra trùng, INSERT
+  TA-->>G: 201 task id=10
+  G-->>M: createTask
+  M-->>O: {ok:true, created:true, task}
+  O->>L: kết quả tool
+  L-->>O: "Đã tạo task #10 ..."
+  O-->>U: xác nhận đã tạo
+```
+
+## Sequence — nhánh lỗi
+
+```mermaid
+sequenceDiagram
+  actor U as User
+  participant O as OpenClaw/LLM
+  participant M as MCP
+  participant TA as Task API (qua GraphQL)
+
+  U->>O: "Tạo task Tối ưu trang chủ cho Nam" (thiếu hạn)
+  O-->>U: "Hạn chót là ngày nào?" (không gọi tool)
+
+  U->>O: "Tạo task X cho Nam hạn 1/11" → "Xác nhận?" → "không"
+  O-->>U: "Đã huỷ, không tạo task." (không gọi tool)
+
+  U->>O: ... xác nhận "ok"
+  O->>M: create_task(...)
+  M->>TA: POST /tasks
+  TA-->>M: 409 DUPLICATE_TASK (existing_task id=4)
+  M-->>O: {ok:false, code:DUPLICATE_TASK, details}
+  O-->>U: "Nam đã có task đang mở 'Tối ưu trang chủ' (#4, hạn 2026-10-20), không tạo thêm."
+
+  Note over M,TA: Agent retry do timeout
+  O->>M: create_task(...) lần 2, cùng nội dung
+  M->>TA: POST /tasks, cùng Idempotency-Key
+  TA-->>M: 201 + Idempotent-Replay: true (task cũ, không INSERT)
+```
+
+## Kịch bản demo (chụp ảnh nộp bài)
+
+| # | Tình huống | Câu nhắn mẫu | Kết quả đúng |
+|---|---|---|---|
+| 1 | Tạo thành công có xác nhận | "Giao cho Nam viết tài liệu API, hạn 2026-10-30" → "ok" | Bot tóm tắt, hỏi xác nhận, rồi báo đã tạo kèm id |
+| 2 | User từ chối | "Tạo task Viết test e2e cho Hoa hạn 2026-11-05" → "không" | "Đã huỷ", log MCP **không** có `create_task` |
+| 3 | Thiếu thông tin | "Tạo task Review code cho Minh" | Bot hỏi hạn chót, không tự điền |
+| 4a | Trùng | "Giao cho Nam việc tối ưu trang chủ hạn 2026-10-30" → "ok" | Bot báo trùng task #4 |
+| 4b | Dữ liệu sai | "Tạo task Họp cho Lan hạn 2026-01-01" → "ok" | Bot báo hạn chót ở quá khứ, hỏi lại ngày |

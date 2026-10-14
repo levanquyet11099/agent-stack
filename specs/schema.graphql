@@ -64,10 +64,27 @@ type TaskPage {
   pageSize: Int!
 }
 
+"Dữ liệu tạo task. Validation và chống trùng do Task API làm."
+input CreateTaskInput {
+  title: String!
+  assigneeId: ID!
+  "YYYY-MM-DD, không được ở quá khứ"
+  dueDate: String!
+}
+
 type Query {
   users(search: String, page: Int = 1, pageSize: Int = 20): UserPage!
   user(id: ID!): User
   tasks(status: TaskStatus, assigneeId: ID, overdue: Boolean, search: String, page: Int = 1, pageSize: Int = 20): TaskPage!
   taskRanking(by: RankBy = TOTAL): [RankingEntry!]!
   task(id: ID!): Task
+}
+
+type Mutation {
+  """
+  Tạo task (~ POST /tasks). idempotencyKey truyền xuống header Idempotency-Key để retry không tạo trùng.
+  Lỗi trả về trong errors[].extensions.code: VALIDATION_ERROR, ASSIGNEE_NOT_FOUND, DUPLICATE_TASK, IDEMPOTENCY_CONFLICT, UPSTREAM_*;
+  extensions.details giữ chi tiết từ REST (trường lỗi, task trùng).
+  """
+  createTask(input: CreateTaskInput!, idempotencyKey: String): Task!
 }
