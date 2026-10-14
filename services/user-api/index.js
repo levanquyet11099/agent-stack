@@ -1,14 +1,23 @@
 import express from 'express';
 import { DatabaseSync } from 'node:sqlite';
+import { log as jlog, withSpanSync } from './otel.js';
 
 const PORT = Number(process.env.PORT ?? 8000);
 const API_KEY = process.env.API_KEY ?? 'dev-key';
-const log = (...a) => console.log(new Date().toISOString(), 'user-api', ...a);
+const log = (...a) => jlog('INFO', a.join(' '));
 
 // Bỏ dấu tiếng Việt, chữ thường — để tìm "duc" ra "Đức"
 const fold = (s) => s.replace(/đ/g, 'd').replace(/Đ/g, 'D').normalize('NFD').replace(/\p{M}/gu, '').toLowerCase();
 
 const db = new DatabaseSync(process.env.DB_PATH ?? 'users.db');
+
+// Mỗi câu SQL là 1 span "db.query" trên Jaeger (node:sqlite không có auto-instrumentation)
+const sql = (text) => {
+  const statement = text.replace(/\s+/g, ' ').trim();
+  const call = (method) => (...p) =>
+    withSpanSync('db.query', { 'db.system': 'sqlite', 'db.name': 'users', 'db.statement': statement }, () => db.prepare(text)[method](...p));
+  return { get: call('get'), all: call('all'), run: call('run') };
+};
 db.function('fold', fold);
 db.exec('CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT, email TEXT, department TEXT)');
 const seed = db.prepare('INSERT OR IGNORE INTO users VALUES (?,?,?,?)');
@@ -59,8 +68,8 @@ app.get('/users', (req, res) => {
     params.push(...list);
   }
   const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
-  const { total } = db.prepare(`SELECT COUNT(*) AS total FROM users ${clause}`).get(...params);
-  const items = db.prepare(`SELECT * FROM users ${clause} ORDER BY id LIMIT ? OFFSET ?`).all(...params, pageSize, (page - 1) * pageSize);
+  const { total } = sql(`SELECT COUNT(*) AS total FROM users ${clause}`).get(...params);
+  const items = sql(`SELECT * FROM users ${clause} ORDER BY id LIMIT ? OFFSET ?`).all(...params, pageSize, (page - 1) * pageSize);
   log(`GET /users q=${q ?? ''} ids=${ids ?? ''} -> ${total}`);
   res.json({ items, total, page, page_size: pageSize });
 });
@@ -68,7 +77,7 @@ app.get('/users', (req, res) => {
 app.get('/users/:id', (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id)) throw invalid([{ loc: ['path', 'id'], msg: 'phải là số nguyên' }]);
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(id);
+  const user = sql('SELECT * FROM users WHERE id = ?').get(id);
   log(`GET /users/${id} found=${!!user}`);
   if (!user) throw new ApiError(404, 'NOT_FOUND', `Không có user id=${id}`);
   res.json(user);
@@ -79,7 +88,7 @@ app.use((_req, _res) => { throw new ApiError(404, 'NOT_FOUND', 'Endpoint không 
 // Format lỗi thống nhất: { error: { code, message, details } }
 app.use((err, _req, res, _next) => {
   const e = err instanceof ApiError ? err : new ApiError(500, 'INTERNAL_ERROR', 'Lỗi hệ thống');
-  if (e.status >= 500) console.error(err);
+  if (e.status >= 500) jlog('ERROR', err.message, { stack: err.stack });
   res.status(e.status).json({ error: { code: e.code, message: e.message, details: e.details ?? null } });
 });
 

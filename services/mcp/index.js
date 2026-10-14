@@ -5,10 +5,12 @@ import express from 'express';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
+import { SpanStatusCode } from '@opentelemetry/api';
+import { log as jlog, withSpan } from './otel.js';
 
 const PORT = Number(process.env.PORT ?? 8000);
 const GRAPHQL_URL = process.env.GRAPHQL_URL ?? 'http://localhost:8003/graphql';
-const log = (...a) => console.log(new Date().toISOString(), 'mcp', ...a);
+const log = (...a) => jlog('INFO', a.join(' '));
 
 async function gql(query, variables) {
   log('-> GraphQL', JSON.stringify(variables));
@@ -22,12 +24,12 @@ async function gql(query, variables) {
     });
     body = await res.json();
   } catch (e) {
-    log('GraphQL unreachable:', e.message);
+    jlog('ERROR', 'GraphQL unreachable: ' + e.message);
     return { ok: false, error: 'Dịch vụ dữ liệu đang không phản hồi, vui lòng thử lại sau.' };
   }
   if (body.errors?.length) {
     const details = body.errors.map((e) => ({ message: e.message, ...e.extensions }));
-    log('GraphQL errors:', JSON.stringify(details));
+    jlog('ERROR', 'GraphQL errors', { errors: details });
     return { ok: false, error: 'Dịch vụ dữ liệu báo lỗi.', details };
   }
   return { ok: true, data: body.data };
@@ -36,6 +38,16 @@ async function gql(query, variables) {
 const result = (obj) => ({ content: [{ type: 'text', text: JSON.stringify(obj) }], isError: obj.ok === false });
 const statusArg = z.enum(['open', 'done']).optional().describe('"open" = chưa xong, "done" = đã xong, bỏ trống = tất cả');
 const toEnum = (s) => (s ? s.toUpperCase() : null);
+
+/** Đăng ký tool, bọc handler trong span "mcp.tool <tên>" để thấy từng tool trên Jaeger. */
+function registerTracedTool(server, name, spec, handler) {
+  server.registerTool(name, spec, (args, extra) =>
+    withSpan(`mcp.tool ${name}`, { 'mcp.tool.name': name }, async (span) => {
+      const out = await handler(args, extra);
+      if (out.isError) span.setStatus({ code: SpanStatusCode.ERROR, message: 'tool trả ok=false' });
+      return out;
+    }));
+}
 
 function buildServer() {
   const server = new McpServer(
@@ -48,7 +60,8 @@ function buildServer() {
     },
   );
 
-  server.registerTool(
+  registerTracedTool(
+    server,
     'find_person_tasks',
     {
       description:
@@ -79,7 +92,8 @@ function buildServer() {
     },
   );
 
-  server.registerTool(
+  registerTracedTool(
+    server,
     'list_tasks',
     {
       description:
@@ -110,7 +124,8 @@ function buildServer() {
     },
   );
 
-  server.registerTool(
+  registerTracedTool(
+    server,
     'rank_people',
     {
       description:
@@ -132,7 +147,8 @@ function buildServer() {
     },
   );
 
-  server.registerTool(
+  registerTracedTool(
+    server,
     'get_task',
     {
       description: 'Xem chi tiết một task theo id, kèm người được giao. found=false nếu không tồn tại.',
@@ -149,7 +165,8 @@ function buildServer() {
     },
   );
 
-  server.registerTool(
+  registerTracedTool(
+    server,
     'create_task',
     {
       description:
@@ -224,7 +241,7 @@ app.post('/mcp', async (req, res) => {
     await server.connect(transport);
     await transport.handleRequest(req, res, req.body);
   } catch (e) {
-    console.error(e);
+    jlog('ERROR', e.message, { stack: e.stack });
     if (!res.headersSent) res.status(500).json({ jsonrpc: '2.0', error: { code: -32603, message: 'Internal error' }, id: null });
   }
 });

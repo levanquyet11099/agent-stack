@@ -219,3 +219,295 @@ sequenceDiagram
 | 3 | Thiếu thông tin | "Tạo task Review code cho Minh" | Bot hỏi hạn chót, không tự điền |
 | 4a | Trùng | "Giao cho Nam việc tối ưu trang chủ hạn 2026-10-30" → "ok" | Bot báo trùng task #4 |
 | 4b | Dữ liệu sai | "Tạo task Họp cho Lan hạn 2026-01-01" → "ok" | Bot báo hạn chót ở quá khứ, hỏi lại ngày |
+
+---
+
+
+# Bài 4 — Tracing với OpenTelemetry + Jaeger
+
+Một lời gọi tool MCP ra đúng **một** trace trên Jaeger, đi qua `mcp → graphql → user-api / task-api → db.query`. Jaeger UI: http://localhost:16686.
+
+## Cách làm (Node thay cho Python trong tài liệu)
+
+| Tài liệu (Python) | Dự án (Node) |
+|---|---|
+| `pip install opentelemetry-distro opentelemetry-exporter-otlp` + `opentelemetry-bootstrap -a install` | `npm i @opentelemetry/api @opentelemetry/auto-instrumentations-node` |
+| `opentelemetry-instrument uvicorn main:app` | `node --import @opentelemetry/auto-instrumentations-node/register index.js` (REST, MCP) · `node --require ./tracing.cjs index.js` (GraphQL, để cấu hình `ignoreTrivialResolveSpans`) |
+| `OTEL_*` trong `environment` của Compose | Như tài liệu, khai một lần bằng YAML anchor `x-otel`, mỗi service tự đặt `OTEL_SERVICE_NAME` |
+| Auto-instrument FastAPI + HTTPX | Auto-instrument `http` (server), `undici` (`fetch` — tự gắn `traceparent`), `express`, `graphql` |
+| `OTEL_PYTHON_LOG_CORRELATION` + `python-json-logger` | `otel.js`: hàm `log()` in JSON, lấy `otelTraceID`/`otelSpanID` từ span đang chạy |
+| `tracer.start_as_current_span(...)` | `withSpan()` / `withSpanSync()` trong `otel.js` (lỗi → `setStatus(ERROR)`, span đỏ) |
+| Auto-instrument psycopg | `node:sqlite` chưa có instrumentation → bọc mỗi câu SQL trong span `db.query` (`db.system=sqlite`, `db.statement`) |
+
+Biến dùng chung (`docker-compose.yml`):
+
+```yaml
+x-otel: &otel
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+  OTEL_EXPORTER_OTLP_PROTOCOL: grpc
+  OTEL_TRACES_EXPORTER: otlp
+  OTEL_METRICS_EXPORTER: none
+  OTEL_LOGS_EXPORTER: none
+  OTEL_NODE_ENABLED_INSTRUMENTATIONS: http,express,graphql,undici
+  OTEL_NODE_RESOURCE_DETECTORS: env,host,os,process   # bỏ dò cloud gây cảnh báo khi chạy local
+```
+
+## Span thủ công
+
+| Service | Span | Thuộc tính |
+|---|---|---|
+| MCP | `mcp.tool <tên tool>` cho cả 5 tool | `mcp.tool.name`; tool trả `ok=false` → span ERROR |
+| GraphQL | `graphql.resolve <field>` (auto, đã bỏ field tầm thường) | path của field |
+| Task API | `validate_task`, `kiem_tra_trung`, `tinh_thong_ke`, `xep_hang` | `task.assignee_id`, `task.duplicate`, `stats.assignee_count`, `ranking.by` |
+| User API, Task API | `db.query` mỗi câu SQL | `db.system`, `db.name`, `db.statement` |
+
+Không gắn dữ liệu nhạy cảm (API key, tên người dùng nhập, nội dung task) vào attribute.
+
+## Trace thành công — `find_person_tasks(name="Lan", status="open")`
+
+```
+mcp | POST /mcp
+  mcp | mcp.tool find_person_tasks
+    mcp | POST (fetch → GraphQL, tự gắn traceparent)
+      graphql | POST /graphql
+        graphql | graphql.parse · graphql.validate
+        graphql | query
+          graphql | graphql.resolve users
+            graphql | GET → user-api | GET /users → db.query × 2
+          graphql | graphql.resolve users.items.*.taskStats      ← DataLoader, 1 lời gọi
+            graphql | GET → task-api | GET /tasks/stats → tinh_thong_ke → db.query
+          graphql | graphql.resolve users.items.*.tasks
+            graphql | GET → task-api | GET /tasks → db.query × 2
+```
+
+24 span, 4 service, 1 trace id. Trước khi bật `ignoreTrivialResolveSpans` + `mergeItems` trace có 53 span (mỗi field `id`, `title`… một span).
+
+## Trace lỗi — tắt `task-api` rồi gọi lại
+
+```
+mcp | mcp.tool find_person_tasks                       ❌ ERROR (tool trả ok=false)
+  graphql | graphql.resolve users                       ✓ user-api trả bình thường
+  graphql | graphql.resolve users.items.*.taskStats     ❌ ERROR
+    graphql | GET → task-api                            ❌ ERROR  (không có span task-api nào)
+  graphql | graphql.resolve users.items.*.tasks         ❌ ERROR
+    graphql | GET → task-api                            ❌ ERROR
+```
+
+Đọc trace: lỗi phát sinh ở lời gọi **GraphQL → Task API**, Task API không nhận được request (không có span phía server). Log GraphQL ghi `ERROR REST GET /tasks thất bại`, MCP trả `UPSTREAM_UNAVAILABLE, service: task-api`. Mất ~8 s mới báo lỗi vì Docker DNS chờ phân giải tên container đã dừng.
+
+## Grep log theo trace id
+
+Trace lỗi ở trên (task-api tắt), trace id `dd03f90e1b3d562ab5fd2ce7956f8677`:
+
+```bash
+docker compose logs --no-log-prefix | grep dd03f90e1b3d562ab5fd2ce7956f8677
+```
+
+```
+mcp       INFO   POST /mcp method=tools/call tool=find_person_tasks
+mcp       INFO   -> GraphQL {"s":"Lan","st":null}
+mcp       ERROR  GraphQL errors
+graphql   INFO   -> REST GET /users?q=Lan&page=1&page_size=5
+graphql   INFO   -> REST GET /tasks?assignee_id=10&page=1&page_size=50
+graphql   INFO   -> REST GET /tasks/stats?assignee_ids=10
+graphql   ERROR  REST GET /tasks/stats thất bại: fetch failed
+graphql   ERROR  REST GET /tasks thất bại: fetch failed
+user-api  INFO   GET /users q=Lan ids= -> 1
+```
+
+Task API không có dòng nào vì đang tắt — đúng với trace. Mỗi dòng log là một object JSON, ví dụ dòng của user-api:
+
+```json
+{"asctime":"2026-10-14T05:26:47.362Z","levelname":"INFO","name":"user-api","message":"GET /users q=Lan ids= -> 1","otelTraceID":"dd03f90e1b3d562ab5fd2ce7956f8677","otelSpanID":"09e1f106ecd28700"}
+```
+
+## Thời gian trung bình từng tầng
+
+`find_person_tasks(Lan, open)` gọi thẳng MCP 6 lần, bỏ lần đầu (làm nóng), số liệu lấy từ Jaeger:
+
+| Tầng | TB (ms) | Min | Max |
+|---|---|---|---|
+| MCP (cả tool) | 1012 | 433 | 2917 |
+| GraphQL (server) | 911 | 368 | 2708 |
+| User API (server) | 117 | 88 | 195 |
+| Task API (server, lượt dài nhất) | 119 | 66 | 185 |
+| DB (tổng `db.query`) | 232 | 167 | 351 |
+
+**Tầng chậm nhất: GraphQL** (gần như toàn bộ thời gian của MCP nằm trong GraphQL):
+
+1. **Hai lượt gọi REST nối tiếp**: phải có kết quả `users` mới biết id để gọi `tasks` và `taskStats` (hai lượt sau chạy song song). Thời gian ≈ lượt 1 + lượt 2, không phải tổng các lời gọi.
+2. **Chi phí mỗi lời gọi HTTP** (mở kết nối, tuần tự hoá JSON) lớn hơn chính thời gian REST xử lý (~120 ms, trong đó SQL ~40–90 ms).
+3. **`graphql.validate`** tốn 60–260 ms mỗi lần vì query được gửi dạng chuỗi, mỗi lần đều parse + validate lại.
+4. Máy chạy local (laptop 4 nhân, CPU thường xuyên cao) nên dao động lớn: Max gấp ~7 lần Min.
+
+Hướng cải thiện nếu cần: cache kết quả parse/validate theo chuỗi query, thêm endpoint REST trả user + stats + tasks trong một lần cho đúng câu hỏi hay gặp, giữ kết nối HTTP (keep-alive) giữa GraphQL và REST.
+
+Toàn bộ lượt trả lời bot (~15–20 s) phần lớn nằm ở OpenClaw (dựng ngữ cảnh ~10–13 s, 2 lượt gọi LLM ~3 s) — xem log `agent turn milestone` của OpenClaw. Phần MCP → GraphQL → REST chỉ chiếm ~0,5–1 s.
+
+## OpenClaw có gửi `traceparent` không
+
+**Không.** Kiểm tra bằng đoạn log tạm ở MCP (bước 3 của tài liệu), hỏi bot 2 câu trong Element:
+
+| Thời điểm | Tool bot gọi | `traceparent` nhận được | Trace id (do MCP tự tạo) |
+|---|---|---|---|
+| 06:46:43 | `list_tasks` | `None` | `68678155…` |
+| 06:48:19 | `find_person_tasks` | `None` | `b49d0f8d6baf1bf329f2c5ed7b809673` |
+
+→ OpenClaw 2026.9.6 (cấu hình hiện tại) không gắn `traceparent` khi gọi MCP, nên **trace bắt đầu từ MCP**. Theo tài liệu như vậy vẫn đủ cho bài này. Thời gian bên trong OpenClaw (dựng ngữ cảnh, gọi LLM) xem ở log `agent turn milestone` của OpenClaw, không có trên Jaeger.
+
+Trace của câu hỏi thật từ bot (`b49d0f8d…`): 24 span, đủ mcp → graphql → user-api, task-api → db.query, tổng 1,66 s phía MCP.
+
+Đoạn log tạm đã xoá khỏi `services/mcp/index.js` sau khi ghi kết quả.
+
+## Đối chiếu tiêu chí (mục 11.8)
+
+| Tiêu chí | Kết quả |
+|---|---|
+| Một câu hỏi ra đúng một trace chứa span của cả 3 tầng | Có: mcp, graphql, user-api, task-api chung 1 trace id |
+| Trace lỗi chỉ ra được tầng gây lỗi | Có: span ERROR tại `graphql → task-api`, không có span task-api |
+| Log JSON, mỗi dòng có `otelTraceID` | Có, cả 4 service |
+| Span thủ công cho nghiệp vụ chính | `mcp.tool *`, `validate_task`, `kiem_tra_trung`, `tinh_thong_ke`, `xep_hang`, `db.query` |
+=======
+# Bài 3 — Đăng nhập SSO cho Element bằng Keycloak
+
+Keycloak chỉ dùng để đăng nhập Element. MCP, GraphQL, REST không thay đổi gì. Bot `@taskbot` và `@admin` vẫn đăng nhập bằng mật khẩu.
+
+## C1 — System Context (cập nhật)
+
+```mermaid
+flowchart LR
+  user([Thành viên team]) -- chat --> element[Element]
+  user -- đăng nhập SSO --> kc[Keycloak]
+  element -- Matrix Client API --> synapse[Synapse]
+  synapse -- OIDC: đổi code lấy token, đọc userinfo --> kc
+  synapse -- sự kiện phòng --> openclaw[OpenClaw bot]
+  openclaw -- prompt / tool call --> llm[(LLM provider)]
+  openclaw -- MCP tools --> taskSys[[Hệ thống Task: MCP + GraphQL + REST]]
+```
+
+## C2 — Container (cập nhật)
+
+```mermaid
+flowchart TB
+  browser([Trình duyệt])
+  subgraph Compose [docker-compose — agent-stack]
+    element[Element :8080]
+    synapse[Synapse :8008]
+    kc[Keycloak :8180<br/>realm geo, client synapse]
+    openclaw[OpenClaw gateway<br/>bot @taskbot]
+    mcp[MCP :8004] --> gql[GraphQL :8003]
+    gql --> uapi[User API :8001] --> udb[(users.db)]
+    gql --> tapi[Task API :8002] --> tdb[(tasks.db)]
+    tapi -. xác minh người được giao .-> uapi
+  end
+  browser --> element
+  browser -- trang đăng nhập<br/>localhost:8180 --> kc
+  element --> synapse
+  synapse -- token / userinfo / jwks<br/>keycloak:8080 (mạng Docker) --> kc
+  synapse --> openclaw
+  openclaw -- mcp:8000/mcp --> mcp
+  openclaw --> llm[(OpenAI)]
+```
+
+## Sequence — đăng nhập SSO (lần đầu)
+
+```mermaid
+sequenceDiagram
+  actor U as User (trình duyệt)
+  participant E as Element :8080
+  participant S as Synapse :8008
+  participant K as Keycloak :8180
+
+  U->>E: mở trang đăng nhập
+  E->>S: GET /_matrix/client/v3/login
+  S-->>E: flows: m.login.sso [Keycloak], m.login.password
+  U->>E: bấm "Keycloak"
+  E->>S: GET /login/sso/redirect/oidc-keycloak?redirectUrl=localhost:8080
+  S-->>U: 302 → localhost:8180/realms/geo/.../auth (client_id=synapse, state, nonce)
+  U->>K: trang đăng nhập Keycloak
+  U->>K: username lan + mật khẩu
+  K-->>U: 302 → localhost:8008/_synapse/client/oidc/callback?code=…
+  U->>S: GET /oidc/callback?code=…
+  S->>K: POST keycloak:8080/.../token (code + client_secret)
+  K-->>S: id_token (iss=http://localhost:8180/realms/geo) + access_token
+  S->>K: GET keycloak:8080/.../certs (kiểm chữ ký id_token)
+  S->>K: GET keycloak:8080/.../userinfo
+  K-->>S: preferred_username=lan, name=Lan Nguyen, email
+  S->>S: localpart_template → @lan:localhost<br/>chưa có → tạo tài khoản, display name, email
+  S-->>U: 302 → localhost:8080 kèm loginToken
+  U->>E: Element đổi loginToken lấy access token (m.login.token)
+  E-->>U: đã đăng nhập @lan:localhost (Lan Nguyen)
+```
+
+Nhánh lỗi thường gặp:
+
+| Bước hỏng | Triệu chứng | Nguyên nhân |
+|---|---|---|
+| Redirect sang Keycloak | `Invalid parameter: redirect_uri` | Valid redirect URI của client khác `public_baseurl` + `_synapse/client/oidc/callback` |
+| Synapse đổi code lấy token | Quay về Synapse báo lỗi | Synapse không gọi được Keycloak, hoặc sai `client_secret` |
+| Kiểm `id_token` | Sai issuer | `KC_HOSTNAME` của Keycloak khác `issuer` trong `homeserver.yaml` |
+| Tạo tài khoản | Tài khoản đã tồn tại | Username Keycloak trùng tài khoản Synapse có sẵn (`admin`, `taskbot`) |
+
+## Cấu hình đã dùng
+
+**Keycloak** (service `keycloak` trong `docker-compose.yml`, cấu hình bằng `keycloak/setup-keycloak.sh` — tương đương thao tác tay ở mục 10.4):
+
+| Mục | Giá trị |
+|---|---|
+| Image | `quay.io/keycloak/keycloak:26.7.1`, `start-dev` |
+| `KC_HOSTNAME` | `http://localhost:8180` (cố định issuer) |
+| `KC_HOSTNAME_BACKCHANNEL_DYNAMIC` | `true` (cho Synapse gọi qua `keycloak:8080` trong mạng Docker) |
+| Realm | `geo` |
+| Client | `synapse`, Client authentication bật, Standard flow bật |
+| Valid redirect URIs | `http://localhost:8008/_synapse/client/oidc/callback` |
+| User test | `lan` (Lan Nguyen, lan@example.com), mật khẩu không Temporary |
+
+**Synapse** (`synapse-data/homeserver.yaml`, không commit — file chứa secret):
+
+```yaml
+public_baseurl: "http://localhost:8008/"
+
+oidc_providers:
+  - idp_id: keycloak
+    idp_name: "Keycloak"
+    issuer: "http://localhost:8180/realms/geo"
+    client_id: "synapse"
+    client_secret: "<ĐÃ CHE>"
+    scopes: ["openid", "profile", "email"]
+    discover: false
+    authorization_endpoint: "http://localhost:8180/realms/geo/protocol/openid-connect/auth"   # trình duyệt
+    token_endpoint: "http://keycloak:8080/realms/geo/protocol/openid-connect/token"           # Synapse, mạng Docker
+    userinfo_endpoint: "http://keycloak:8080/realms/geo/protocol/openid-connect/userinfo"
+    jwks_uri: "http://keycloak:8080/realms/geo/protocol/openid-connect/certs"
+    skip_verification: true   # local http, chỉ dùng cho local
+    user_mapping_provider:
+      config:
+        localpart_template: "{{ user.preferred_username }}"
+        display_name_template: "{{ user.name }}"
+        email_template: "{{ user.email }}"
+
+sso:
+  client_whitelist:
+    - "http://localhost:8080/"   # quay về Element không hiện trang hỏi xác nhận
+```
+
+**Khác tài liệu và lý do:**
+
+| Tài liệu | Ở đây | Lý do |
+|---|---|---|
+| `docker run keycloak` riêng + Synapse `--add-host` | Keycloak và Synapse cùng `docker-compose` | 3 endpoint phía server dùng `keycloak:8080` thay vì `host.docker.internal:8180` |
+| Không có | `KC_HOSTNAME_BACKCHANNEL_DYNAMIC=true` | Keycloak 26 chấp nhận gọi back-channel qua hostname nội bộ, issuer vẫn là `localhost:8180` |
+| Không có | `sso.client_whitelist` | Bỏ trang trung gian "Continue to localhost:8080?" của Synapse |
+| Bot chỉ cho `@admin` | Thêm `@lan:localhost` vào `groupAllowFrom` / `dm.allowFrom` | Để user SSO hỏi được bot (mục 10.7 bước 5) |
+
+## Kết quả kiểm tra
+
+| Tiêu chí (mục 10.9) | Kết quả |
+|---|---|
+| Màn hình đăng nhập Element có nút Keycloak | `GET /login` trả `m.login.sso [Keycloak]` |
+| Đăng nhập user Keycloak, tài khoản Matrix tự tạo lần đầu | `@lan:localhost`, `external_ids: oidc-keycloak` |
+| Tên hiển thị lấy từ Keycloak | `Lan Nguyen` |
+| Bot và admin vẫn đăng nhập bằng mật khẩu | `m.login.password` vẫn bật |
+| Không có secret trong repo | `homeserver.yaml`, `.env.local`, `openclaw.json` trong `.gitignore` |
+
+Ảnh nộp bài: màn hình đăng nhập có nút Keycloak · trang đăng nhập Keycloak · Element sau khi đăng nhập là Lan Nguyen · Lan hỏi bot trong phòng, bot trả lời.

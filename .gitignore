@@ -7,3 +7,5 @@ node_modules/
 data/
 openclaw/openclaw.json
 openclaw/*.bak
+*.bak
+services/*/node_modules/
